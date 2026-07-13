@@ -1,17 +1,17 @@
-"""Learning agents for MiniClash.
+"""Observation encoding, action space, and a linear Q-learning agent for MiniClash.
 
-Why not the tabular Q-learning from Gridworld.py? MiniClash's state is continuous
-and unbounded (float unit positions, a variable number of units, elixir, tower HPs),
-so there is no finite table to index. We keep the *idea* of Q-learning but swap the
-table for a linear function approximator: Q(s, a) = W[a] . phi(s), where phi(s) is a
-small hand-crafted, normalized feature vector. That handles continuous state, stays
-stable, and is easy to inspect -- a natural step up from the Gridworld table.
+Why not the tabular Q-learning from Gridworld.py? MiniClash's state is continuous and
+unbounded, so there's no finite table to index. We keep the Q-learning *idea* but swap
+the table for a function approximator over a small, hand-crafted feature vector.
+`LinearQAgent` here is the simple baseline; `mlp_agent.MLPQAgent` is the upgrade that
+can actually learn to hold elixir and counterpush (see that file and train.py).
 
 Two design choices keep the problem tractable:
   * Observations are encoded from the acting team's *own* perspective (progress is
-    measured "toward the enemy"), so a single agent architecture works for either side.
+    measured "toward the enemy"), so one agent design works for either side.
   * The raw action space -- (hand slot) x (spawn_x) x (spawn_y) -- is ~1000 placements
     per tick. We collapse it to 17 discrete choices: no-op, or (slot x lane x depth).
+    Spells auto-target the densest enemy cluster, so the agent only decides *when*.
 """
 
 import numpy as np
@@ -48,11 +48,35 @@ def _decode(action: int) -> tuple[int, int, int]:
     return slot, lane, depth
 
 
-def action_to_env(team: int, action: int) -> tuple[int, int, int] | None:
-    """Map a discrete action to the engine's (hand_slot, spawn_x, spawn_y) or None."""
+def _spell_target(env: MiniClash, team: int, radius: float) -> tuple[int, int]:
+    """Aim a spell at the enemy unit with the most neighbours within `radius`.
+    Falls back to chipping the nearest standing enemy crown tower if no units exist."""
+    enemy = P1 if team == P0 else P0
+    foes = [u for u in env.state.units.values() if u.team == enemy and u.hp > 0]
+    if foes:
+        best, best_n = foes[0], -1
+        for c in foes:
+            n = sum(1 for u in foes if (u.x - c.x) ** 2 + (u.y - c.y) ** 2 <= radius ** 2)
+            if n > best_n:
+                best, best_n = c, n
+        return int(round(best.x)), int(round(best.y))
+    # No troops on the field: chip a crown tower instead of wasting the spell.
+    crowns = [t for t in env.state.towers if t.team == enemy and t.kind != "king" and t.hp > 0]
+    tw = crowns[0] if crowns else next(t for t in env.state.towers if t.team == enemy and t.kind == "king")
+    cx, cy = tw.center
+    return int(cx), int(cy)
+
+
+def action_to_env(env: MiniClash, team: int, action: int) -> tuple[int, int, int] | None:
+    """Map a discrete action to the engine's (hand_slot, spawn_x, spawn_y) or None.
+    For spell cards the lane/depth are ignored and the target is chosen automatically."""
     if action == 0:
         return None
     slot, lane, depth = _decode(action)
+    cdef = env.card_defs[env.state.players[team].hand[slot]]
+    if cdef.is_spell:
+        tx, ty = _spell_target(env, team, cdef.spell_radius)
+        return slot, tx, ty
     return slot, _LANE_X[lane], _DEPTH_Y[team][depth]
 
 
@@ -64,8 +88,7 @@ def legal_mask(env: MiniClash, team: int) -> np.ndarray:
     ps = env.state.players[team]
     for a in range(1, N_ACTIONS):
         slot, _, _ = _decode(a)
-        cost = env.card_defs[ps.hand[slot]].unit_def.cost
-        if ps.elixir >= cost:
+        if ps.elixir >= env.card_defs[ps.hand[slot]].cost:
             mask[a] = True
     return mask
 
@@ -73,7 +96,7 @@ def legal_mask(env: MiniClash, team: int) -> np.ndarray:
 # ====================
 # Observation encoder
 # ====================
-N_FEATURES = 26
+N_FEATURES = 41
 
 
 def _progress(team: int, y: float) -> float:
@@ -98,50 +121,67 @@ def encode(env: MiniClash, team: int) -> np.ndarray:
     f[0] = 1.0  # bias
     f[1] = st.players[team].elixir / 10.0
     f[2] = st.players[enemy].elixir / 10.0
-    f[3] = st.time_left / 180.0
+    f[3] = (st.players[team].elixir - st.players[enemy].elixir) / 10.0
+    f[4] = st.time_left / 180.0
 
-    # Per-lane unit pressure (counts + furthest advance for each side).
+    # Committed elixir on the field, and pressure on each half.
+    on_my_half = (lambda y: y < RIVER_Y0) if team == P0 else (lambda y: y > RIVER_Y1)
+    on_enemy_half = (lambda y: y > RIVER_Y1) if team == P0 else (lambda y: y < RIVER_Y0)
+    my_value = en_value = 0.0
+    en_on_mine = my_on_enemy = 0
     my_cnt = [0, 0]; en_cnt = [0, 0]
     my_adv = [0.0, 0.0]; en_adv = [0.0, 0.0]
+    en_tank = [0.0, 0.0]  # is an enemy building-targeter (Giant) pushing this lane?
     for u in st.units.values():
         if u.hp <= 0:
             continue
-        lane = u.lane
-        adv = _progress(u.team, u.y)  # advance toward that unit's target
+        adv = _progress(u.team, u.y)
         if u.team == team:
-            my_cnt[lane] += 1
-            my_adv[lane] = max(my_adv[lane], adv)
+            my_value += u.udef.cost
+            my_cnt[u.lane] += 1
+            my_adv[u.lane] = max(my_adv[u.lane], adv)
+            if on_enemy_half(u.y):
+                my_on_enemy += 1
         else:
-            en_cnt[lane] += 1
-            en_adv[lane] = max(en_adv[lane], adv)
+            en_value += u.udef.cost
+            en_cnt[u.lane] += 1
+            en_adv[u.lane] = max(en_adv[u.lane], adv)
+            if u.udef.targets_buildings:
+                en_tank[u.lane] = 1.0
+            if on_my_half(u.y):
+                en_on_mine += 1
 
-    i = 4
+    f[5] = my_value / 20.0
+    f[6] = en_value / 20.0
+    f[7] = min(en_on_mine, 5) / 5.0
+    f[8] = min(my_on_enemy, 5) / 5.0
+
+    i = 9
     for lane in (0, 1):
         f[i] = min(my_cnt[lane], 5) / 5.0; i += 1
         f[i] = min(en_cnt[lane], 5) / 5.0; i += 1
         f[i] = my_adv[lane]; i += 1
         f[i] = en_adv[lane]; i += 1
+        f[i] = en_tank[lane]; i += 1
 
-    # Tower HP fractions (mine, then enemy).
     for t in (team, enemy):
         for kind in ("crownL", "crownR", "king"):
             f[i] = _tower_frac(env, t, kind); i += 1
 
-    # Hand: affordability + card identity (knight=0, archer=1) per slot.
     ps = st.players[team]
     for slot in range(N_SLOTS):
-        name = ps.hand[slot]
-        cost = env.card_defs[name].unit_def.cost
-        f[i] = 1.0 if ps.elixir >= cost else 0.0; i += 1
-    for slot in range(N_SLOTS):
-        f[i] = 1.0 if ps.hand[slot].lower().startswith("archer") else 0.0; i += 1
+        cdef = env.card_defs[ps.hand[slot]]
+        f[i] = 1.0 if ps.elixir >= cdef.cost else 0.0; i += 1
+        f[i] = 1.0 if cdef.is_spell else 0.0; i += 1
+        f[i] = 1.0 if cdef.targets_buildings else 0.0; i += 1
+        f[i] = cdef.cost / 10.0; i += 1
 
     assert i == N_FEATURES, f"feature count mismatch: {i} != {N_FEATURES}"
     return f
 
 
 # ====================
-# Linear Q-learning agent
+# Linear Q-learning agent (simple baseline)
 # ====================
 class LinearQAgent:
     """Q(s, a) = W[a] . phi(s), trained with epsilon-greedy TD(0) updates."""
@@ -162,9 +202,8 @@ class LinearQAgent:
         legal = np.flatnonzero(mask)
         if not greedy and self.rng.random() < self.eps:
             return int(self.rng.choice(legal))
-        q = self.q_values(phi)
-        q_masked = np.where(mask, q, -np.inf)
-        best = np.flatnonzero(q_masked == q_masked.max())
+        q = np.where(mask, self.q_values(phi), -np.inf)
+        best = np.flatnonzero(q == q.max())
         return int(self.rng.choice(best))  # random tie-break
 
     def update(self, phi: np.ndarray, action: int, reward: float,

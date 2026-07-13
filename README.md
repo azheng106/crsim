@@ -1,66 +1,166 @@
 # MiniClash — Self-Play Reinforcement Learning
 
-A Clash Royale–style battle simulator where two bots learn to play
-**against each other** from scratch via self-play reinforcement learning.
+A Clash Royale–style battle simulator where two bots learn to play **against each other**
+from scratch via self-play reinforcement learning.
 
-Two agents share no weights and improve simultaneously, so each one's opponent keeps
-getting stronger as training proceeds — the defining feature (and challenge) of
-self-play. After a few minutes of training on a laptop CPU, both learned agents beat
-the built-in random bot in over 80% of games from either side.
+Two agents improve simultaneously, so each one's opponent keeps getting stronger as
+training proceeds — the defining feature (and challenge) of self-play. Three learners are
+implemented, from a tabular-style linear baseline up to **PPO**. The PPO agent learns to
+*hold elixir* and commit a coordinated push — the strategic behaviour the value-based
+agents never discovered — and roughly doubles the win rate against a strong hand-written
+heuristic.
 
 ## What's here
 
 | File | Purpose |
 |------|---------|
-| `ClashSim.py` | The game engine + a pygame renderer. Two lanes, a river with bridges, crown/king towers, elixir, a deck/hand cycle, and two unit types (Knight, Archer). Exposes a Gym-style RL API: `reset()` and `step(actions) -> (state, rewards, done)`. |
-| `agent.py` | The observation encoder, discrete action space, and a linear function-approximation Q-learning agent. |
-| `train.py` | Self-play training loop, greedy evaluation, and a `--watch` mode to render trained agents. |
+| `ClashSim.py` | Game engine + pygame renderer. Two lanes, a river with bridges, crown/king towers, an elixir economy, a deck/hand cycle, five cards, and a Gym-style RL API: `reset()` and `step(actions) -> (state, rewards, done)`. Also holds `random_bot` and the stronger `heuristic_bot`. |
+| `agent.py` | Observation encoder, the 17-action discrete action space, and `LinearQAgent` (simple baseline). |
+| `mlp_agent.py` | `MLPQAgent` — value-based upgrade: a NumPy MLP Q-function with a replay buffer, target network, and n-step returns. |
+| `ppo_agent.py` | `PPOAgent` — on-policy clipped actor-critic (shared policy, GAE, entropy bonus), all NumPy with a numeric gradient check. |
+| `train.py` | Self-play training for all three learners, evaluation vs the heuristic/random bots, and a `--watch` renderer. |
 | `Gridworld.py` | A standalone tabular Q-learning warm-up on a 5×5 grid (kept as a reference). |
 
 ## Quick start
 
 ```bash
-# create/activate a venv, then:
 pip install numpy pygame
 
-python train.py                     # train both bots, evaluate, save weights
-python train.py --episodes 2000     # train longer
-python train.py --watch             # watch the trained bots play (space = pause, r = reset)
-python ClashSim.py                  # original random-bot demo
+python train.py --agent ppo                 # train the PPO self-play policy, evaluate, save
+python train.py --agent ppo --episodes 4000 # train longer
+python train.py --agent ppo --watch         # watch the trained policy play (space = pause, r = reset)
+python train.py --agent mlp                 # the value-based learner
+python train.py --agent linear              # the simplest baseline learner
+python ClashSim.py                          # heuristic-vs-heuristic demo (no learning)
+python ppo_agent.py                         # numerically verify the PPO backprop
 ```
 
-Training saves two weight files: `crsim_agents_p0.npz` and `crsim_agents_p1.npz`.
+Training saves two weight files, `<model>_p0.npz` and `<model>_p1.npz` (PPO shares one
+policy across both).
+
+## The game
+
+- **Troops** — Knight (sturdy melee), Archer (ranged), Giant (slow tank that *ignores
+  troops and marches on towers*), Goblins (a fast, fragile 3-unit swarm).
+- **Spell** — Arrows (instant area damage; wipes swarms, chips towers). Cast anywhere.
+- **Opponents** — `random_bot` (deploys at random) and `heuristic_bot`, a rule-based
+  baseline that defends the threatened lane, answers swarms with Arrows, and pushes with
+  a Giant when elixir is plentiful.
 
 ## How the learning works
 
-MiniClash's state is continuous and unbounded (float unit positions, a variable number
-of units, elixir, tower HPs), so the tabular Q-learning in `Gridworld.py` has no finite
-table to index. We keep the Q-learning *idea* but replace the table with a **linear
-function approximator**:
+MiniClash's state is continuous and unbounded, so the tabular Q-learning in
+`Gridworld.py` has no finite table to index. We keep the Q-learning *idea* but replace
+the table with a function approximator over a 41-feature, perspective-normalized
+observation (elixir, committed field value, per-lane pressure, tower HP, hand contents).
+The raw action space (~1000 placements/tick) is collapsed to **17 discrete choices**:
+no-op, or (slot × lane × depth); spells auto-target the densest enemy cluster, so the
+agent only decides *when* to cast.
 
-```
-Q(s, a) = W[a] · φ(s)
-```
+**Reward** is dense: net tower damage each tick, a net **elixir-trade** term (killing more
+elixir value than you lose in a fight), small spend/overflow penalties to discourage
+mindless dumping, plus a terminal ±10 for the result.
 
-- **Observation `φ(s)`** — a 26-feature vector, normalized and encoded from the acting
-  team's *own* perspective (progress is measured "toward the enemy"), so one agent design
-  works for either side. Features cover elixir, per-lane unit pressure, tower HP
-  fractions, and the current hand.
-- **Actions** — the raw action space (hand slot × spawn_x × spawn_y ≈ 1000 placements per
-  tick) is collapsed to **17 discrete choices**: no-op, or (slot × lane × depth), with
-  legal-action masking so a card is only playable when it can be afforded.
-- **Reward** — dense shaping from the tower-HP swing each tick (you gain by damaging enemy
-  towers, lose when yours take damage), plus a terminal ±5 for winning/losing.
-- **Training** — ε-greedy TD(0) updates, ε decaying 1.0 → 0.05, both agents learning online
-  from their own experience each tick.
+Three learners are provided, in increasing order of capability:
+
+- **`LinearQAgent`** — `Q(s,a) = W[a]·φ(s)`, online one-step TD. A solid baseline.
+- **`MLPQAgent`** — value-based upgrade: a ReLU-MLP Q-function with **n-step returns**
+  (delayed credit for a counterpush), a **replay buffer**, and a **target network**.
+- **`PPOAgent`** — on-policy clipped actor-critic. A single shared policy plays both sides
+  (the observation is perspective-normalized), trained with **GAE**, a clipped surrogate,
+  and an annealed **entropy bonus**. All NumPy with hand-written backprop + Adam; run
+  `python ppo_agent.py` to numerically verify the gradients.
+
+### Why PPO — and what it learned
+
+Both Q-learning agents get stuck in an **elixir-dumping local optimum**: they spend on a
+cheap troop the instant they can afford one (average elixir ~1.4/10), never commit the
+Giant, and get overwhelmed. The counterpush machinery (n-step returns, elixir-trade
+reward, spend penalties) is all present — but the fix isn't reward-weakness. A controlled
+experiment cranking `SPEND_SCALE` 5× *did not change the behaviour at all*. The bottleneck
+is **exploration**: the "hold to 5+, then Giant + support" line needs ~15 coordinated
+decisions in a row, which epsilon-greedy (random single-action jitter) essentially never
+samples, so the payoff of holding is never experienced.
+
+PPO explores with a *stochastic policy* shaped by an entropy bonus, which samples coherent
+multi-step behaviour far more readily. The result: it **learns to hold elixir** (average
+rises to ~2.6/10 in play, and its greedy trace holds all the way to ~7) and commits the
+Giant far more often — the strategic behaviour the value-based agents never found.
+
+> **Evaluation note:** a stochastic policy must be evaluated by *sampling*, not greedy
+> argmax. PPO's argmax over-selects no-op (it has plurality but not majority probability),
+> collapsing the agent into passivity — greedy eval reports ~8% vs the heuristic while the
+> same policy sampled scores ~35–40%. `evaluate()`/`--watch` sample automatically for PPO.
 
 ## Results
 
-800 episodes (~3 min on CPU). Self-play stays balanced (~40–60% each, no draws), and both
-learned agents dominate the random baseline:
+Win rate vs each baseline, ~400 games, averaged over both sides (PPO sampled; value-based
+agents greedy):
 
-| Match | Wins |
-|-------|------|
-| trained P0 vs trained P1 | 194 – 106 |
-| trained P0 vs **random** P1 | **278 – 22** |
-| **random** P0 vs trained P1 | 48 – **250** |
+| Agent | vs `random_bot` | vs `heuristic_bot` |
+|-------|-----------------|--------------------|
+| `heuristic_bot` (reference) | ~97% | — |
+| `LinearQAgent` / `MLPQAgent` (self-play) | ~85% | ~15–21% |
+| **`PPOAgent` (self-play)** | **~90%** | **~35–40%** |
+
+PPO roughly doubles the win rate against the strong heuristic and, more importantly,
+exhibits the target behaviour: holding elixir for a coordinated push instead of dumping.
+
+## Development journey
+
+This project was built iteratively, and most of the learning came from diagnosing why
+things *didn't* work. The honest arc:
+
+1. **Tabular Q-learning warm-up** (`Gridworld.py`) to get the RL loop right on a problem
+   with a finite state table.
+
+2. **Built the MiniClash engine**, then found it couldn't produce a decision at all: every
+   game ended in a draw. Instrumentation showed units got stuck ~2.5–3 tiles from the enemy
+   king (out of attack range) because a "bridge-crossing" movement guard fired everywhere,
+   not just at the river. Rewrote movement as a waypoint scheme → games became decisive and
+   symmetric. (Also fixed a winner off-by-one and a broken HP-bar draw.)
+
+3. **Wired up the RL reward** — `step()` had returned a hardcoded `0.0`, so nothing could
+   learn. Added dense tower-damage shaping plus a terminal win/loss bonus.
+
+4. **Linear Q-learning self-play** worked as a proof of life (beat random handily), so I
+   built `heuristic_bot` as a *much* stronger yardstick and added real cards (Giant,
+   Goblins, Arrows) to create genuine elixir-trade decisions.
+
+5. **MLP Q-learning** (n-step returns, replay, target net) + an elixir-trade reward +
+   opponent-pool anchoring against the heuristic. Beat random ~85% — but stalled at
+   ~15–21% vs the heuristic across several runs.
+
+6. **Diagnosed the plateau.** Instrumenting games revealed an *elixir-dumping local
+   optimum*: average elixir sat at ~1.4/10 and the Giant was almost never played. The agent
+   was spending on cheap troops the instant it could afford them.
+
+7. **Ran a controlled experiment** to find the cause: cranked the spend penalty 5×,
+   changing one variable. Behaviour did **not** move at all. That ruled out "reward too
+   weak" and pointed at **exploration** — epsilon-greedy never samples the ~15-decision
+   "hold, then commit a push" sequence, so holding never looks rewarding.
+
+8. **Implemented PPO from scratch** (gradient-checked before training). Its entropy-driven
+   stochastic exploration finally discovered holding elixir, ~doubling the win rate vs the
+   heuristic.
+
+9. **Caught an evaluation pitfall:** PPO's greedy argmax over-picks no-op and looks
+   passive (~8% vs heuristic), while the *same policy sampled* scores ~35–40%. Fixed the
+   evaluator to sample for stochastic policies.
+
+The takeaway that generalizes: **measure behaviour, not just win rate, and change one
+variable at a time** — the spend-penalty experiment is what turned "the agent is bad" into
+the specific, correct diagnosis "this is an exploration problem."
+
+## Notes & next steps
+
+PPO clears the elixir-dumping trap but doesn't yet *beat* the heuristic outright — a
+genuinely strong bar. The most promising remaining levers:
+- **Exact placement as a learned output** instead of the fixed lane×depth grid — the
+  coarse action space likely caps execution quality more than the algorithm now does.
+- A **larger opponent pool** (frozen past selves, not just the heuristic) to harden the
+  self-play policy against diverse strategies.
+- King-damage-weighted reward and longer training.
+
+The scaffolding (environment, reward, encoder, all three agents, self-play/opponent-pool
+training) is algorithm-agnostic, so these are localized changes rather than rewrites.
