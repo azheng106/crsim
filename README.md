@@ -99,7 +99,6 @@ agents greedy):
 
 | Agent | vs `random_bot` | vs `heuristic_bot` |
 |-------|-----------------|--------------------|
-| `heuristic_bot` (reference) | ~97% | — |
 | `LinearQAgent` / `MLPQAgent` (self-play) | ~85% | ~15–21% |
 | **`PPOAgent` (self-play)** | **~90%** | **~35–40%** |
 
@@ -109,7 +108,7 @@ exhibits the target behaviour: holding elixir for a coordinated push instead of 
 ## Development journey
 
 This project was built iteratively, and most of the learning came from diagnosing why
-things *didn't* work. The honest arc:
+things *didn't* work. The process:
 
 1. **Tabular Q-learning warm-up** (`Gridworld.py`) to get the RL loop right on a problem
    with a finite state table.
@@ -148,19 +147,6 @@ things *didn't* work. The honest arc:
    passive (~8% vs heuristic), while the *same policy sampled* scores ~35–40%. Fixed the
    evaluator to sample for stochastic policies.
 
-The takeaway that generalizes: **measure behaviour, not just win rate, and change one
+The takeaway that generalizes: **measure behavior, not just win rate, and change one
 variable at a time** — the spend-penalty experiment is what turned "the agent is bad" into
 the specific, correct diagnosis "this is an exploration problem."
-
-## Notes & next steps
-
-PPO clears the elixir-dumping trap but doesn't yet *beat* the heuristic outright — a
-genuinely strong bar. The most promising remaining levers:
-- **Exact placement as a learned output** instead of the fixed lane×depth grid — the
-  coarse action space likely caps execution quality more than the algorithm now does.
-- A **larger opponent pool** (frozen past selves, not just the heuristic) to harden the
-  self-play policy against diverse strategies.
-- King-damage-weighted reward and longer training.
-
-The scaffolding (environment, reward, encoder, all three agents, self-play/opponent-pool
-training) is algorithm-agnostic, so these are localized changes rather than rewrites.
