@@ -90,7 +90,7 @@ Giant far more often — the strategic behaviour the value-based agents never fo
 > **Evaluation note:** a stochastic policy must be evaluated by *sampling*, not greedy
 > argmax. PPO's argmax over-selects no-op (it has plurality but not majority probability),
 > collapsing the agent into passivity — greedy eval reports ~8% vs the heuristic while the
-> same policy sampled scores ~35–40%. `evaluate()`/`--watch` sample automatically for PPO.
+> same policy sampled scores ~45-50%. `evaluate()`/`--watch` sample automatically for PPO.
 
 ## Results
 
@@ -99,10 +99,10 @@ agents greedy):
 
 | Agent | vs `random_bot` | vs `heuristic_bot` |
 |-------|-----------------|--------------------|
-| `LinearQAgent` / `MLPQAgent` (self-play) | ~85% | ~15–21% |
-| **`PPOAgent` (self-play)** | **~90%** | **~35–40%** |
+| `LinearQAgent` / `MLPQAgent` (self-play) | ~85% | ~15–21%            |
+| **`PPOAgent` (self-play)** | **~90%** | **~45-50%**        |
 
-PPO roughly doubles the win rate against the strong heuristic and, more importantly,
+PPO more than doubles the win rate against the strong heuristic and, more importantly,
 exhibits the target behaviour: holding elixir for a coordinated push instead of dumping.
 
 ## Development journey
@@ -144,7 +144,7 @@ things *didn't* work. The process:
    heuristic.
 
 9. **Caught an evaluation pitfall:** PPO's greedy argmax over-picks no-op and looks
-   passive (~8% vs heuristic), while the *same policy sampled* scores ~35–40%. Fixed the
+   passive (~8% vs heuristic), while the *same policy sampled* scores ~45-50%. Fixed the
    evaluator to sample for stochastic policies.
 
 The takeaway that generalizes: **measure behavior, not just win rate, and change one
